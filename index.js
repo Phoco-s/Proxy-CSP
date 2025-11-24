@@ -1,76 +1,90 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const puppeteer = require('puppeteer');
 const cors = require('cors');
 const app = express();
+const http = require('http').createServer(app);
+const io = require('socket.io')(http, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors());
+app.use(express.json());
 
-app.get('/status', (req, res) => res.send('🥷 Navigator Stealth Tunnel (v4.3)'));
+let browser;
+let page;
 
-app.use('/proxy', (req, res, next) => {
-    const targetUrl = req.query.url;
+// Inicializa o Chrome no Servidor
+async function initBrowser() {
+    if (browser) return;
+    browser = await puppeteer.launch({
+        headless: "new",
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800']
+    });
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    console.log("🤖 Browser Remoto Iniciado");
+}
 
-    if (!targetUrl) return res.status(400).send('Url required');
+initBrowser();
 
-    let finalTarget = targetUrl;
-    if (!finalTarget.startsWith('http')) finalTarget = 'https://' + finalTarget;
-
-    // Extrai o domínio alvo para usar nos headers falsos
-    let targetDomain = '';
+// 1. Endpoint para navegar para uma URL
+app.post('/navigate', async (req, res) => {
+    const { url } = req.body;
+    if (!page) await initBrowser();
     try {
-        targetDomain = new URL(finalTarget).origin;
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 10000 }).catch(e => console.log("Carregamento contínuo..."));
+        res.json({ status: 'ok' });
     } catch (e) {
-        console.error("URL Inválida");
+        res.status(500).json({ error: e.message });
     }
-
-    createProxyMiddleware({
-        target: finalTarget,
-        changeOrigin: true, // Isso muda o Host header para o do alvo
-        ws: true,
-        pathRewrite: { '^/proxy': '' },
-        followRedirects: true,
-        cookieDomainRewrite: { "*": "" }, // Tenta fazer os cookies funcionarem no localhost/render
-        
-        onProxyReq: (proxyReq, req, res) => {
-            // 1. A MENTIRA PERFEITA (Spoofing)
-            // Dizemos ao site que estamos vindo dele mesmo
-            if (targetDomain) {
-                proxyReq.setHeader('Origin', targetDomain);
-                proxyReq.setHeader('Referer', targetDomain + '/');
-            }
-
-            // 2. CAMUFLAGEM (Stealth)
-            // Removemos cabeçalhos que o Render adiciona e que denunciam o proxy
-            proxyReq.removeHeader('x-forwarded-for');
-            proxyReq.removeHeader('x-forwarded-proto');
-            proxyReq.removeHeader('x-forwarded-port');
-            proxyReq.removeHeader('via');
-
-            // User-Agent de um Chrome Comum
-            proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-        },
-
-        onProxyRes: (proxyRes, req, res) => {
-            // Remove as travas de segurança do Notion/Google
-            const badHeaders = [
-                'x-frame-options', 
-                'content-security-policy', 
-                'frame-options', 
-                'content-security-policy-report-only'
-            ];
-            badHeaders.forEach(h => delete proxyRes.headers[h]);
-
-            // Força permissão para rodar no iframe
-            proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-        },
-
-        onError: (err, req, res) => {
-            console.error('❌ Stealth Error:', err.message);
-            if (!res.headersSent) res.status(500).send('WAF Block ou Erro: ' + err.message);
-        }
-    })(req, res, next);
 });
 
-app.listen(PORT, () => console.log(`🥷 Stealth Proxy rodando na porta ${PORT}`));
+// 2. O CORAÇÃO DO SURFLY: Stream de Imagens (MJPEG)
+// O cliente carrega <img src="/stream"> e vê o site em tempo real
+app.get('/stream', async (req, res) => {
+    if (!page) await initBrowser();
+
+    res.writeHead(200, {
+        'Content-Type': 'multipart/x-mixed-replace; boundary=--myboundary',
+        'Cache-Control': 'no-cache',
+        'Connection': 'close',
+        'Pragma': 'no-cache'
+    });
+
+    const streamLoop = setInterval(async () => {
+        try {
+            // Tira screenshot em buffer (rápido)
+            const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
+            res.write(`--myboundary\nContent-Type: image/jpeg\nContent-Length: ${screenshot.length}\n\n`);
+            res.write(screenshot);
+            res.write('\n');
+        } catch (e) {
+            clearInterval(streamLoop);
+        }
+    }, 200); // 5 frames por segundo (Aumente para melhor fluidez, mas gasta mais CPU)
+
+    req.on('close', () => clearInterval(streamLoop));
+});
+
+// 3. Recebe Interações do Usuário (Clique/Teclado) via Socket.IO
+io.on('connection', (socket) => {
+    console.log('Cliente conectado ao controle remoto');
+
+    socket.on('interaction', async (data) => {
+        if (!page) return;
+        try {
+            if (data.type === 'click') {
+                // Converte coordenadas do iframe para o navegador real
+                await page.mouse.click(data.x, data.y);
+            } else if (data.type === 'scroll') {
+                await page.mouse.wheel({ deltaY: data.deltaY });
+            } else if (data.type === 'key') {
+                await page.keyboard.type(data.key);
+            }
+        } catch (e) {
+            console.error("Erro de interação:", e.message);
+        }
+    });
+});
+
+http.listen(PORT, () => console.log(`📺 Streaming Server rodando na porta ${PORT}`));
