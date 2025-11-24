@@ -7,62 +7,70 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors({ origin: true, credentials: true }));
 
-app.get('/status', (req, res) => res.send('⚡ Navigator Tunnel está ONLINE (v4.2 Fixed)'));
+app.get('/status', (req, res) => res.send('🥷 Navigator Stealth Tunnel (v4.3)'));
 
 app.use('/proxy', (req, res, next) => {
     const targetUrl = req.query.url;
 
-    if (!targetUrl) {
-        return res.status(400).send('Faltou a URL alvo (?url=...)');
-    }
+    if (!targetUrl) return res.status(400).send('Url required');
 
-    // Validação básica para evitar erros de protocolo
     let finalTarget = targetUrl;
-    if (!finalTarget.startsWith('http')) {
-        finalTarget = 'https://' + finalTarget;
+    if (!finalTarget.startsWith('http')) finalTarget = 'https://' + finalTarget;
+
+    // Extrai o domínio alvo para usar nos headers falsos
+    let targetDomain = '';
+    try {
+        targetDomain = new URL(finalTarget).origin;
+    } catch (e) {
+        console.error("URL Inválida");
     }
 
     createProxyMiddleware({
         target: finalTarget,
-        changeOrigin: true,
-        ws: true, // Suporte a WebSockets (Slack/Notion)
-        pathRewrite: {
-            '^/proxy': '', 
-        },
-        // CORREÇÃO: Definimos os headers aqui para evitar o erro ERR_HTTP_HEADERS_SENT
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        },
-        followRedirects: true, // Importante para login do Google/Notion
+        changeOrigin: true, // Isso muda o Host header para o do alvo
+        ws: true,
+        pathRewrite: { '^/proxy': '' },
+        followRedirects: true,
+        cookieDomainRewrite: { "*": "" }, // Tenta fazer os cookies funcionarem no localhost/render
         
+        onProxyReq: (proxyReq, req, res) => {
+            // 1. A MENTIRA PERFEITA (Spoofing)
+            // Dizemos ao site que estamos vindo dele mesmo
+            if (targetDomain) {
+                proxyReq.setHeader('Origin', targetDomain);
+                proxyReq.setHeader('Referer', targetDomain + '/');
+            }
+
+            // 2. CAMUFLAGEM (Stealth)
+            // Removemos cabeçalhos que o Render adiciona e que denunciam o proxy
+            proxyReq.removeHeader('x-forwarded-for');
+            proxyReq.removeHeader('x-forwarded-proto');
+            proxyReq.removeHeader('x-forwarded-port');
+            proxyReq.removeHeader('via');
+
+            // User-Agent de um Chrome Comum
+            proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+        },
+
         onProxyRes: (proxyRes, req, res) => {
-            // Remove travas de segurança
-            const securityHeaders = [
+            // Remove as travas de segurança do Notion/Google
+            const badHeaders = [
                 'x-frame-options', 
                 'content-security-policy', 
                 'frame-options', 
                 'content-security-policy-report-only'
             ];
+            badHeaders.forEach(h => delete proxyRes.headers[h]);
 
-            securityHeaders.forEach(header => {
-                delete proxyRes.headers[header];
-            });
-
-            // Garante permissão de CORS no retorno
+            // Força permissão para rodar no iframe
             proxyRes.headers['Access-Control-Allow-Origin'] = '*';
         },
-        
-        // CORREÇÃO: Tratamento de erros para não derrubar o servidor
+
         onError: (err, req, res) => {
-            console.error('❌ Erro no Proxy:', err.message);
-            // Evita tentar responder se a conexão já fechou
-            if (!res.headersSent) {
-                res.status(500).send('Erro no Tunnel: ' + err.message);
-            }
+            console.error('❌ Stealth Error:', err.message);
+            if (!res.headersSent) res.status(500).send('WAF Block ou Erro: ' + err.message);
         }
     })(req, res, next);
 });
 
-app.listen(PORT, () => {
-    console.log(`🛡️ Tunnel de Produtividade rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🥷 Stealth Proxy rodando na porta ${PORT}`));
