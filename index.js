@@ -1,90 +1,63 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
 const app = express();
-const http = require('http').createServer(app);
-const io = require('socket.io')(http, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: true, credentials: true }));
 
-let browser;
-let page;
+app.get('/status', (req, res) => res.send('✅ Navigator Tunnel Stable (v5.0)'));
 
-// Inicializa o Chrome no Servidor
-async function initBrowser() {
-    if (browser) return;
-    browser = await puppeteer.launch({
-        headless: "new",
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800']
-    });
-    page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-    console.log("🤖 Browser Remoto Iniciado");
-}
+app.use('/proxy', (req, res, next) => {
+    const targetUrl = req.query.url;
 
-initBrowser();
+    if (!targetUrl) return res.status(400).send('Url required');
 
-// 1. Endpoint para navegar para uma URL
-app.post('/navigate', async (req, res) => {
-    const { url } = req.body;
-    if (!page) await initBrowser();
-    try {
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 10000 }).catch(e => console.log("Carregamento contínuo..."));
-        res.json({ status: 'ok' });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
+    let finalTarget = targetUrl;
+    if (!finalTarget.startsWith('http')) finalTarget = 'https://' + finalTarget;
 
-// 2. O CORAÇÃO DO SURFLY: Stream de Imagens (MJPEG)
-// O cliente carrega <img src="/stream"> e vê o site em tempo real
-app.get('/stream', async (req, res) => {
-    if (!page) await initBrowser();
+    createProxyMiddleware({
+        target: finalTarget,
+        changeOrigin: true, // Muda o 'Host' header automaticamente (Vital para Notion)
+        ws: true, // WebSockets para Slack
+        pathRewrite: { '^/proxy': '' },
+        followRedirects: true, // Segue login do Google/Notion
+        
+        // 1. CORREÇÃO CRÍTICA: Definimos headers aqui, não no onProxyReq
+        // Isso evita o erro ERR_HTTP_HEADERS_SENT durante redirecionamentos
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'X-Frame-Options': '', // Tenta anular envio pelo cliente
+        },
 
-    res.writeHead(200, {
-        'Content-Type': 'multipart/x-mixed-replace; boundary=--myboundary',
-        'Cache-Control': 'no-cache',
-        'Connection': 'close',
-        'Pragma': 'no-cache'
-    });
+        // 2. Limpeza da RESPOSTA (O que vem do site para você)
+        onProxyRes: (proxyRes, req, res) => {
+            // Remove travas de segurança do Notion/Google
+            const badHeaders = [
+                'x-frame-options', 
+                'content-security-policy', 
+                'frame-options', 
+                'content-security-policy-report-only',
+                'access-control-allow-origin' // Nós vamos definir isso manualmente abaixo
+            ];
+            
+            badHeaders.forEach(h => delete proxyRes.headers[h]);
 
-    const streamLoop = setInterval(async () => {
-        try {
-            // Tira screenshot em buffer (rápido)
-            const screenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-            res.write(`--myboundary\nContent-Type: image/jpeg\nContent-Length: ${screenshot.length}\n\n`);
-            res.write(screenshot);
-            res.write('\n');
-        } catch (e) {
-            clearInterval(streamLoop);
-        }
-    }, 200); // 5 frames por segundo (Aumente para melhor fluidez, mas gasta mais CPU)
+            // Permite o iframe
+            proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+            proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+            proxyRes.headers['Access-Control-Allow-Headers'] = 'X-Requested-With, Content-Type, Authorization';
+        },
 
-    req.on('close', () => clearInterval(streamLoop));
-});
-
-// 3. Recebe Interações do Usuário (Clique/Teclado) via Socket.IO
-io.on('connection', (socket) => {
-    console.log('Cliente conectado ao controle remoto');
-
-    socket.on('interaction', async (data) => {
-        if (!page) return;
-        try {
-            if (data.type === 'click') {
-                // Converte coordenadas do iframe para o navegador real
-                await page.mouse.click(data.x, data.y);
-            } else if (data.type === 'scroll') {
-                await page.mouse.wheel({ deltaY: data.deltaY });
-            } else if (data.type === 'key') {
-                await page.keyboard.type(data.key);
+        // 3. Tratamento de Erros (Para o servidor não cair nunca mais)
+        onError: (err, req, res) => {
+            console.error('⚠️ Erro de Proxy:', err.code);
+            if (!res.headersSent) {
+                res.status(500).send(`Erro de conexão: ${err.message}`);
             }
-        } catch (e) {
-            console.error("Erro de interação:", e.message);
         }
-    });
+    })(req, res, next);
 });
 
-http.listen(PORT, () => console.log(`📺 Streaming Server rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Stable Proxy rodando na porta ${PORT}`));
