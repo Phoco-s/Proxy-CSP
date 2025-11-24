@@ -1,63 +1,76 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 
 app.use(cors({ origin: true, credentials: true }));
+app.use(cookieParser());
 
-app.get('/status', (req, res) => res.send('✅ Navigator Tunnel Stable (v5.0)'));
+// Rota de status (deve vir antes do proxy)
+app.get('/status', (req, res) => res.send('🍪 Session Proxy Online (v6.0)'));
 
-app.use('/proxy', (req, res, next) => {
-    const targetUrl = req.query.url;
-
-    if (!targetUrl) return res.status(400).send('Url required');
-
-    let finalTarget = targetUrl;
-    if (!finalTarget.startsWith('http')) finalTarget = 'https://' + finalTarget;
-
-    createProxyMiddleware({
-        target: finalTarget,
-        changeOrigin: true, // Muda o 'Host' header automaticamente (Vital para Notion)
-        ws: true, // WebSockets para Slack
-        pathRewrite: { '^/proxy': '' },
-        followRedirects: true, // Segue login do Google/Notion
+// Middleware para salvar o alvo no cookie
+app.use((req, res, next) => {
+    const urlQuery = req.query.url;
+    if (urlQuery) {
+        let target = urlQuery;
+        if (!target.startsWith('http')) target = 'https://' + target;
         
-        // 1. CORREÇÃO CRÍTICA: Definimos headers aqui, não no onProxyReq
-        // Isso evita o erro ERR_HTTP_HEADERS_SENT durante redirecionamentos
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'X-Frame-Options': '', // Tenta anular envio pelo cliente
-        },
-
-        // 2. Limpeza da RESPOSTA (O que vem do site para você)
-        onProxyRes: (proxyRes, req, res) => {
-            // Remove travas de segurança do Notion/Google
-            const badHeaders = [
-                'x-frame-options', 
-                'content-security-policy', 
-                'frame-options', 
-                'content-security-policy-report-only',
-                'access-control-allow-origin' // Nós vamos definir isso manualmente abaixo
-            ];
-            
-            badHeaders.forEach(h => delete proxyRes.headers[h]);
-
-            // Permite o iframe
-            proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-            proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
-            proxyRes.headers['Access-Control-Allow-Headers'] = 'X-Requested-With, Content-Type, Authorization';
-        },
-
-        // 3. Tratamento de Erros (Para o servidor não cair nunca mais)
-        onError: (err, req, res) => {
-            console.error('⚠️ Erro de Proxy:', err.code);
-            if (!res.headersSent) {
-                res.status(500).send(`Erro de conexão: ${err.message}`);
-            }
-        }
-    })(req, res, next);
+        // Salva apenas a ORIGEM (ex: https://www.google.com) no cookie
+        try {
+            const urlObj = new URL(target);
+            res.cookie('proxy_target', urlObj.origin, { 
+                maxAge: 900000, // 15 minutos
+                httpOnly: false,
+                secure: true,
+                sameSite: 'none'
+            });
+        } catch(e) {}
+    }
+    next();
 });
 
-app.listen(PORT, () => console.log(`🚀 Stable Proxy rodando na porta ${PORT}`));
+// A ROTA MÁGICA (Coringa)
+// Captura qualquer coisa: /search, /assets, /login, /proxy
+const proxyOptions = {
+    target: 'https://www.google.com', // Alvo padrão (placeholder)
+    changeOrigin: true,
+    ws: true,
+    router: (req) => {
+        // 1. Prioridade: URL na query string (?url=...)
+        if (req.query.url) {
+            let url = req.query.url;
+            if (!url.startsWith('http')) url = 'https://' + url;
+            return url; // Usa a URL completa fornecida
+        }
+        
+        // 2. Prioridade: Cookie da sessão anterior
+        if (req.cookies.proxy_target) {
+            return req.cookies.proxy_target;
+        }
+
+        // 3. Fallback (se não tiver nada, joga erro ou manda pro Google)
+        return 'https://www.google.com'; 
+    },
+    pathRewrite: (path, req) => {
+        // Se a requisição veio com ?url=..., removemos o caminho original para acessar a raiz do site
+        if (req.query.url) return '/';
+        return path; // Se for navegação interna (/search), mantém o path
+    },
+    onProxyRes: (proxyRes, req, res) => {
+        const badHeaders = ['x-frame-options', 'content-security-policy', 'frame-options'];
+        badHeaders.forEach(h => delete proxyRes.headers[h]);
+        proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+    },
+    onError: (err, req, res) => {
+        if (!res.headersSent) res.send(`Erro (Tente recarregar com a URL original): ${err.message}`);
+    }
+};
+
+// Aplica o proxy na raiz "/" para pegar tudo
+app.use('/', createProxyMiddleware(proxyOptions));
+
+app.listen(PORT, () => console.log(`🍪 Session Proxy rodando na porta ${PORT}`));
