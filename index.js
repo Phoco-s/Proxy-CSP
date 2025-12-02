@@ -8,117 +8,151 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 3000;
 
-// Variáveis Globais do Navegador
+// Configuração da Resolução
+const VIEWPORT = { width: 1000, height: 700 };
 let browser = null;
 let page = null;
-let streamInterval = null;
 
-// Configuração da Resolução (Deve bater com o tamanho da janela da extensão)
-const VIEWPORT = { width: 1000, height: 700 };
-
+// Inicializa o Navegador
 async function startBrowser() {
     if (browser) return;
     console.log("🚀 Iniciando Chrome Remoto...");
-    
     browser = await puppeteer.launch({
         headless: "new",
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Vital para Docker/Render
+            '--disable-dev-shm-usage',
             `--window-size=${VIEWPORT.width},${VIEWPORT.height}`
         ]
     });
-    
     page = await browser.newPage();
     await page.setViewport(VIEWPORT);
-    
-    // User Agent de gente normal
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    console.log("✅ Navegador Pronto!");
 }
 
 startBrowser();
 
-// 1. Endpoint de Navegação (Muda a URL)
-app.get('/navigate', async (req, res) => {
-    const url = req.query.url;
-    if (!page) await startBrowser();
-    
-    try {
-        let target = url.startsWith('http') ? url : 'https://' + url;
-        console.log(`Página indo para: ${target}`);
-        await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        res.send('OK');
-    } catch (e) {
-        console.error(e);
-        res.status(500).send(e.message);
-    }
+// 1. O "Viewer" (Interface do Cliente que roda dentro do iframe)
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { margin: 0; background: #000; overflow: hidden; display: flex; flex-direction: column; height: 100vh; font-family: sans-serif; }
+                #controls { background: #222; padding: 10px; display: flex; gap: 10px; }
+                input { flex: 1; padding: 8px; border-radius: 4px; border: none; background: #333; color: #fff; }
+                button { padding: 8px 15px; cursor: pointer; background: #6699cc; color: white; border: none; border-radius: 4px; font-weight: bold; }
+                #screen-container { flex: 1; position: relative; cursor: default; display: flex; justify-content: center; align-items: center; }
+                img { display: block; max-width: 100%; max-height: 100%; user-select: none; -webkit-user-drag: none; }
+            </style>
+        </head>
+        <body>
+            <div id="controls">
+                <input id="urlInput" placeholder="URL (ex: notion.so)" />
+                <button onclick="navigate()">Ir 🚀</button>
+            </div>
+            <div id="screen-container">
+                <img id="stream" src="/stream" />
+            </div>
+
+            <script src="/socket.io/socket.io.js"></script>
+            <script>
+                const socket = io();
+                const img = document.getElementById('stream');
+                const input = document.getElementById('urlInput');
+                const container = document.getElementById('screen-container');
+
+                function navigate() {
+                    const url = input.value;
+                    fetch('/navigate?url=' + encodeURIComponent(url))
+                        .then(() => img.src = "/stream?t=" + Date.now()); // Recarrega stream
+                }
+
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') navigate();
+                });
+
+                // Captura Cliques
+                img.onmousedown = (e) => {
+                    const rect = img.getBoundingClientRect();
+                    // Calcula a posição relativa baseada no tamanho real da imagem renderizada
+                    const scaleX = ${VIEWPORT.width} / rect.width;
+                    const scaleY = ${VIEWPORT.height} / rect.height;
+                    
+                    const x = (e.clientX - rect.left) * scaleX;
+                    const y = (e.clientY - rect.top) * scaleY;
+                    
+                    socket.emit('input', { type: 'click', x, y });
+                };
+
+                // Captura Teclado
+                document.addEventListener('keydown', (e) => {
+                    if (document.activeElement !== input) {
+                        if (e.key.length === 1) socket.emit('input', { type: 'type', key: e.key });
+                        else socket.emit('input', { type: 'keyPress', key: e.key });
+                    }
+                });
+
+                // Captura Scroll
+                container.onwheel = (e) => {
+                    e.preventDefault();
+                    socket.emit('input', { type: 'scroll', deltaY: e.deltaY });
+                };
+            </script>
+        </body>
+        </html>
+    `);
 });
 
-// 2. O Stream de Vídeo (MJPEG)
-// O navegador local vai carregar <img src="/stream">
+// 2. Navegação
+app.get('/navigate', async (req, res) => {
+    if (!page) await startBrowser();
+    try {
+        let url = req.query.url;
+        if (!url.startsWith('http')) url = 'https://' + url;
+        console.log("Navegando para:", url);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(e=>console.log(e));
+        res.send('ok');
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+// 3. Stream MJPEG
 app.get('/stream', async (req, res) => {
     if (!page) await startBrowser();
-
     res.writeHead(200, {
         'Content-Type': 'multipart/x-mixed-replace; boundary=--frame',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Pragma': 'no-cache'
+        'Connection': 'keep-alive'
     });
-
-    // Loop de Captura (FPS)
-    // No Free Tier, 200ms (5fps) é seguro. Se tiver servidor bom, tente 50ms (20fps).
     const loop = setInterval(async () => {
         try {
-            if (!page) return;
-            // Tira screenshot em buffer (JPEG é mais leve que PNG)
-            const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 });
-            
-            res.write(`--frame\nContent-Type: image/jpeg\nContent-Length: ${screenshot.length}\n\n`);
-            res.write(screenshot);
-            res.write('\n');
-        } catch (error) {
-            // Ignora erros de frame drop
-        }
-    }, 200);
-
-    req.on('close', () => {
-        clearInterval(loop);
-    });
+            if (page) {
+                const buff = await page.screenshot({ type: 'jpeg', quality: 50 });
+                res.write(`--frame\nContent-Type: image/jpeg\nContent-Length: ${buff.length}\n\n`);
+                res.write(buff);
+                res.write('\n');
+            }
+        } catch (e) {}
+    }, 200); // 5 FPS
+    req.on('close', () => clearInterval(loop));
 });
 
-// 3. Canal de Controle (Mouse/Teclado via Socket)
+// 4. Socket IO (Inputs)
 io.on('connection', (socket) => {
-    console.log('🎮 Controle Remoto Conectado');
-
     socket.on('input', async (data) => {
         if (!page) return;
         try {
-            if (data.type === 'click') {
-                await page.mouse.click(data.x, data.y);
-            } 
-            else if (data.type === 'type') {
-                await page.keyboard.type(data.key);
-            }
-            else if (data.type === 'keyPress') {
-                 await page.keyboard.press(data.key);
-            }
-            else if (data.type === 'scroll') {
-                await page.mouse.wheel({ deltaY: data.deltaY });
-            }
-        } catch (e) {
-            console.error("Input lag:", e.message);
-        }
+            if (data.type === 'click') await page.mouse.click(data.x, data.y);
+            else if (data.type === 'type') await page.keyboard.type(data.key);
+            else if (data.type === 'keyPress') await page.keyboard.press(data.key);
+            else if (data.type === 'scroll') await page.mouse.wheel({ deltaY: data.deltaY });
+        } catch(e){}
     });
 });
 
-server.listen(PORT, () => console.log(`📺 Pixel Streaming rodando na porta ${PORT}`));
+server.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
